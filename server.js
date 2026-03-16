@@ -6,35 +6,123 @@ const helmet = require("helmet");
 const morgan = require("morgan");
 const rateLimit = require("express-rate-limit");
 const { v4: uuidv4 } = require("uuid");
+const { Pool } = require("pg");
 const path = require("path");
 
 const app = express();
 
-// ─── MIDDLEWARE ─────────────────────────────────────────────────────────────
-app.use(helmet({ contentSecurityPolicy: false })); // allow inline scripts in HTML
+// ─── STARTUP CHECKS ──────────────────────────────────────────────────────────
+const REQUIRED_ENV = [
+  "MPESA_CONSUMER_KEY",
+  "MPESA_CONSUMER_SECRET",
+  "MPESA_SHORTCODE",
+  "MPESA_PASSKEY",
+  "CALLBACK_URL",
+  "DATABASE_URL",
+  "ADMIN_SECRET",
+];
+const missing = REQUIRED_ENV.filter((k) => !process.env[k]);
+if (missing.length) {
+  console.error("❌ Missing env vars:", missing.join(", "));
+  process.exit(1);
+}
+
+const callbackUrl = process.env.CALLBACK_URL;
+if (!callbackUrl.startsWith("https://")) {
+  console.error("❌ CALLBACK_URL must start with https://"); process.exit(1);
+}
+if (!callbackUrl.includes("/api/mpesa/callback")) {
+  console.error("❌ CALLBACK_URL must end with /api/mpesa/callback"); process.exit(1);
+}
+console.log("✅ CALLBACK_URL:", callbackUrl);
+
+// ─── DATABASE ─────────────────────────────────────────────────────────────────
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === "production" ? { rejectUnauthorized: false } : false,
+});
+
+async function initDB() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS orders (
+      id                   SERIAL PRIMARY KEY,
+      order_id             UUID NOT NULL UNIQUE,
+      checkout_request_id  TEXT UNIQUE,
+      merchant_request_id  TEXT,
+      phone                TEXT NOT NULL,
+      amount               INTEGER NOT NULL,
+      customer_name        TEXT NOT NULL,
+      size                 TEXT,
+      quantity             INTEGER,
+      delivery_type        TEXT,
+      status               TEXT NOT NULL DEFAULT 'PENDING',
+      mpesa_receipt        TEXT,
+      transaction_date     TEXT,
+      paid_amount          INTEGER,
+      failure_reason       TEXT,
+      created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      paid_at              TIMESTAMPTZ
+    )
+  `);
+  console.log("✅ Database ready");
+}
+
+async function createOrder(d) {
+  const { rows } = await pool.query(
+    `INSERT INTO orders (order_id,checkout_request_id,merchant_request_id,phone,amount,customer_name,size,quantity,delivery_type)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+    [d.orderId,d.checkoutRequestId,d.merchantRequestId,d.phone,d.amount,d.customerName,d.size,d.quantity,d.deliveryType]
+  );
+  return rows[0];
+}
+
+async function getOrderByCheckout(id) {
+  const { rows } = await pool.query("SELECT * FROM orders WHERE checkout_request_id=$1",[id]);
+  return rows[0] || null;
+}
+
+async function markOrderPaid(id, receipt, txDate, paidAmount) {
+  await pool.query(
+    "UPDATE orders SET status='PAID',mpesa_receipt=$2,transaction_date=$3,paid_amount=$4,paid_at=NOW() WHERE checkout_request_id=$1",
+    [id, receipt, txDate, paidAmount]
+  );
+}
+
+async function markOrderFailed(id, reason) {
+  await pool.query("UPDATE orders SET status='FAILED',failure_reason=$2 WHERE checkout_request_id=$1",[id,reason]);
+}
+
+async function updateOrderStatus(id, status) {
+  await pool.query("UPDATE orders SET status=$2 WHERE checkout_request_id=$1",[id,status]);
+}
+
+// ─── MIDDLEWARE ───────────────────────────────────────────────────────────────
+app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors());
 app.use(express.json());
 app.use(morgan("dev"));
 
-// Rate limit: max 20 payment requests per 15 minutes per IP
 const paymentLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 20,
+  windowMs: 15 * 60 * 1000, max: 20,
   message: { success: false, message: "Too many requests. Please try again later." },
 });
 
-// ─── SERVE FRONTEND ──────────────────────────────────────────────────────────
+// ✅ FIX 3 — Admin auth middleware
+function requireAdminAuth(req, res, next) {
+  const token = (req.headers["authorization"] || "").split(" ")[1];
+  if (!token || token !== process.env.ADMIN_SECRET) {
+    return res.status(401).json({ success: false, message: "Unauthorized. Pass header: Authorization: Bearer <ADMIN_SECRET>" });
+  }
+  next();
+}
+
 app.use(express.static(path.join(__dirname)));
 
-// ─── IN-MEMORY ORDER STORE ───────────────────────────────────────────────────
-// For production, replace with a real database (MongoDB, PostgreSQL, etc.)
-const orders = new Map();
-
-// ─── M-PESA CONFIG ───────────────────────────────────────────────────────────
+// ─── M-PESA CONFIG ────────────────────────────────────────────────────────────
 const MPESA_CONFIG = {
   consumerKey: process.env.MPESA_CONSUMER_KEY,
   consumerSecret: process.env.MPESA_CONSUMER_SECRET,
-  shortcode: process.env.MPESA_SHORTCODE || "174379",
+  shortcode: process.env.MPESA_SHORTCODE,
   passkey: process.env.MPESA_PASSKEY,
   callbackUrl: process.env.CALLBACK_URL,
   env: process.env.MPESA_ENV || "sandbox",
@@ -52,297 +140,157 @@ const MPESA_URLS = {
     query: "https://api.safaricom.co.ke/mpesa/stkpushquery/v1/query",
   },
 };
-
 const urls = MPESA_URLS[MPESA_CONFIG.env];
 
-// ─── HELPERS ─────────────────────────────────────────────────────────────────
-
-/** Get OAuth access token from Safaricom */
 async function getMpesaToken() {
-  const credentials = Buffer.from(
-    `${MPESA_CONFIG.consumerKey}:${MPESA_CONFIG.consumerSecret}`
-  ).toString("base64");
-
-  const response = await axios.get(urls.auth, {
-    headers: { Authorization: `Basic ${credentials}` },
-  });
-
-  return response.data.access_token;
+  const creds = Buffer.from(`${MPESA_CONFIG.consumerKey}:${MPESA_CONFIG.consumerSecret}`).toString("base64");
+  const r = await axios.get(urls.auth, { headers: { Authorization: `Basic ${creds}` } });
+  return r.data.access_token;
 }
 
-/** Generate Base64 timestamp password */
 function generatePassword() {
-  const timestamp = new Date()
-    .toISOString()
-    .replace(/[^0-9]/g, "")
-    .slice(0, 14);
-  const password = Buffer.from(
-    `${MPESA_CONFIG.shortcode}${MPESA_CONFIG.passkey}${timestamp}`
-  ).toString("base64");
+  const timestamp = new Date().toISOString().replace(/[^0-9]/g,"").slice(0,14);
+  const password = Buffer.from(`${MPESA_CONFIG.shortcode}${MPESA_CONFIG.passkey}${timestamp}`).toString("base64");
   return { password, timestamp };
 }
 
-/** Format phone: 0723851228 → 254723851228 */
 function formatPhone(phone) {
-  const cleaned = phone.replace(/\s+/g, "").replace(/^0/, "254");
-  if (!/^254[0-9]{9}$/.test(cleaned)) {
-    throw new Error("Invalid phone number. Use format: 07XXXXXXXX");
-  }
+  const cleaned = phone.replace(/\s+/g,"").replace(/^0/,"254");
+  if (!/^254[0-9]{9}$/.test(cleaned)) throw new Error("Invalid phone number. Use format: 07XXXXXXXX");
   return cleaned;
 }
 
-// ─── ROUTES ──────────────────────────────────────────────────────────────────
+// ─── ROUTES ───────────────────────────────────────────────────────────────────
 
-/**
- * POST /api/mpesa/stkpush
- * Initiates M-Pesa STK Push to customer's phone
- */
 app.post("/api/mpesa/stkpush", paymentLimiter, async (req, res) => {
   try {
     const { phone, amount, customerName, size, quantity, deliveryType } = req.body;
-
-    // Validate inputs
-    if (!phone || !amount || !customerName) {
-      return res.status(400).json({
-        success: false,
-        message: "Phone, amount and customer name are required",
-      });
-    }
-
-    if (amount < 1 || amount > 150000) {
-      return res.status(400).json({
-        success: false,
-        message: "Amount must be between KSh 1 and KSh 150,000",
-      });
-    }
+    if (!phone || !amount || !customerName)
+      return res.status(400).json({ success: false, message: "Phone, amount and name are required" });
+    if (amount < 1 || amount > 150000)
+      return res.status(400).json({ success: false, message: "Amount must be between KSh 1 and KSh 150,000" });
 
     const formattedPhone = formatPhone(phone);
     const orderId = uuidv4();
     const token = await getMpesaToken();
     const { password, timestamp } = generatePassword();
 
-    const stkPayload = {
+    const response = await axios.post(urls.stkpush, {
       BusinessShortCode: MPESA_CONFIG.shortcode,
-      Password: password,
-      Timestamp: timestamp,
+      Password: password, Timestamp: timestamp,
       TransactionType: "CustomerPayBillOnline",
-      // For Till (Buy Goods), use: "CustomerBuyGoodsOnline"
       Amount: Math.round(amount),
-      PartyA: formattedPhone,
-      PartyB: MPESA_CONFIG.shortcode,
+      PartyA: formattedPhone, PartyB: MPESA_CONFIG.shortcode,
       PhoneNumber: formattedPhone,
       CallBackURL: MPESA_CONFIG.callbackUrl,
-      AccountReference: `LG-${orderId.slice(0, 8).toUpperCase()}`,
-      TransactionDesc: `Loosian Grocers - ${size} Passion Fruit Pulp x${quantity}`,
-    };
+      AccountReference: `LG-${orderId.slice(0,8).toUpperCase()}`,
+      TransactionDesc: `Loosian Grocers - ${size} x${quantity}`,
+    }, { headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" } });
 
-    const response = await axios.post(urls.stkpush, stkPayload, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-      },
+    const { CheckoutRequestID, MerchantRequestID, ResponseCode, ResponseDescription } = response.data;
+    if (ResponseCode !== "0")
+      return res.status(400).json({ success: false, message: ResponseDescription || "Failed to initiate payment" });
+
+    // ✅ FIX 1 — Save to PostgreSQL, not in-memory
+    await createOrder({
+      orderId, checkoutRequestId: CheckoutRequestID, merchantRequestId: MerchantRequestID,
+      phone: formattedPhone, amount, customerName, size, quantity, deliveryType,
     });
 
-    const { CheckoutRequestID, MerchantRequestID, ResponseCode, ResponseDescription } =
-      response.data;
-
-    if (ResponseCode !== "0") {
-      return res.status(400).json({
-        success: false,
-        message: ResponseDescription || "Failed to initiate payment",
-      });
-    }
-
-    // Store order for callback matching
-    orders.set(CheckoutRequestID, {
-      orderId,
-      checkoutRequestId: CheckoutRequestID,
-      merchantRequestId: MerchantRequestID,
-      phone: formattedPhone,
-      amount,
-      customerName,
-      size,
-      quantity,
-      deliveryType,
-      status: "PENDING",
-      createdAt: new Date().toISOString(),
-    });
-
-    console.log(`✅ STK Push sent | Order: ${orderId} | Phone: ${formattedPhone} | KSh ${amount}`);
-
-    res.json({
-      success: true,
-      message: "STK Push sent. Please check your phone.",
-      checkoutRequestId: CheckoutRequestID,
-      orderId,
-    });
-  } catch (error) {
-    console.error("STK Push error:", error?.response?.data || error.message);
-
-    if (error.message.includes("Invalid phone")) {
-      return res.status(400).json({ success: false, message: error.message });
-    }
-
-    res.status(500).json({
-      success: false,
-      message: "Payment initiation failed. Please try again.",
-      detail: error?.response?.data?.errorMessage || error.message,
-    });
+    console.log(`✅ STK Push sent | ${orderId} | ${formattedPhone} | KSh ${amount}`);
+    res.json({ success: true, message: "STK Push sent. Please check your phone.", checkoutRequestId: CheckoutRequestID, orderId });
+  } catch (err) {
+    console.error("STK Push error:", err?.response?.data || err.message);
+    if (err.message.includes("Invalid phone"))
+      return res.status(400).json({ success: false, message: err.message });
+    res.status(500).json({ success: false, message: "Payment initiation failed. Please try again.", detail: err?.response?.data?.errorMessage || err.message });
   }
 });
 
-/**
- * POST /api/mpesa/callback
- * Safaricom sends payment confirmation here
- */
-app.post("/api/mpesa/callback", (req, res) => {
+app.post("/api/mpesa/callback", async (req, res) => {
   try {
-    const { Body } = req.body;
-    const { stkCallback } = Body;
-    const { MerchantRequestID, CheckoutRequestID, ResultCode, ResultDesc, CallbackMetadata } =
-      stkCallback;
-
-    console.log(`📩 Callback received | CheckoutID: ${CheckoutRequestID} | Result: ${ResultCode}`);
-
-    const order = orders.get(CheckoutRequestID);
-
-    if (!order) {
-      console.warn(`⚠️  Order not found for CheckoutRequestID: ${CheckoutRequestID}`);
-      return res.json({ ResultCode: 0, ResultDesc: "Accepted" });
-    }
+    const { stkCallback } = req.body.Body;
+    const { CheckoutRequestID, ResultCode, ResultDesc, CallbackMetadata } = stkCallback;
+    console.log(`📩 Callback | ${CheckoutRequestID} | Result: ${ResultCode}`);
 
     if (ResultCode === 0) {
-      // Payment successful — extract M-Pesa details
       const meta = {};
-      if (CallbackMetadata?.Item) {
-        CallbackMetadata.Item.forEach((item) => {
-          meta[item.Name] = item.Value;
-        });
-      }
-
-      order.status = "PAID";
-      order.mpesaReceiptNumber = meta.MpesaReceiptNumber;
-      order.transactionDate = meta.TransactionDate;
-      order.paidAmount = meta.Amount;
-      order.paidAt = new Date().toISOString();
-
-      console.log(
-        `🎉 PAYMENT SUCCESS | Order: ${order.orderId} | Receipt: ${meta.MpesaReceiptNumber} | KSh ${meta.Amount}`
-      );
-
-      // TODO: Send confirmation SMS, update database, notify warehouse, etc.
+      CallbackMetadata?.Item?.forEach(i => { meta[i.Name] = i.Value; });
+      await markOrderPaid(CheckoutRequestID, meta.MpesaReceiptNumber, String(meta.TransactionDate), meta.Amount);
+      console.log(`🎉 PAID | Receipt: ${meta.MpesaReceiptNumber} | KSh ${meta.Amount}`);
     } else {
-      order.status = "FAILED";
-      order.failureReason = ResultDesc;
-      console.log(`❌ Payment failed | Order: ${order.orderId} | Reason: ${ResultDesc}`);
+      await markOrderFailed(CheckoutRequestID, ResultDesc);
+      console.log(`❌ Failed | ${ResultDesc}`);
     }
-
-    orders.set(CheckoutRequestID, order);
-
-    // Always respond 200 to Safaricom
     res.json({ ResultCode: 0, ResultDesc: "Accepted" });
-  } catch (error) {
-    console.error("Callback error:", error.message);
+  } catch (err) {
+    console.error("Callback error:", err.message);
     res.json({ ResultCode: 0, ResultDesc: "Accepted" });
   }
 });
 
-/**
- * GET /api/mpesa/status/:checkoutRequestId
- * Frontend polls this to check if payment was confirmed
- */
 app.get("/api/mpesa/status/:checkoutRequestId", async (req, res) => {
   const { checkoutRequestId } = req.params;
+  const order = await getOrderByCheckout(checkoutRequestId);
+  if (!order) return res.status(404).json({ success: false, message: "Order not found" });
 
-  const order = orders.get(checkoutRequestId);
-
-  if (!order) {
-    return res.status(404).json({ success: false, message: "Order not found" });
-  }
-
-  // If still pending after 30s, query Safaricom directly
   if (order.status === "PENDING") {
     try {
       const token = await getMpesaToken();
       const { password, timestamp } = generatePassword();
-
-      const queryRes = await axios.post(
-        urls.query,
-        {
-          BusinessShortCode: MPESA_CONFIG.shortcode,
-          Password: password,
-          Timestamp: timestamp,
-          CheckoutRequestID: checkoutRequestId,
-        },
-        {
-          headers: {
-            Authorization: `Bearer ${token}`,
-            "Content-Type": "application/json",
-          },
-        }
+      const qr = await axios.post(urls.query,
+        { BusinessShortCode: MPESA_CONFIG.shortcode, Password: password, Timestamp: timestamp, CheckoutRequestID: checkoutRequestId },
+        { headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" } }
       );
-
-      const { ResultCode, ResultDesc } = queryRes.data;
-
-      if (ResultCode === "0") {
-        order.status = "PAID";
-        orders.set(checkoutRequestId, order);
-      } else if (ResultCode !== "1032") {
-        // 1032 = still waiting for user input
-        order.status = "FAILED";
-        order.failureReason = ResultDesc;
-        orders.set(checkoutRequestId, order);
-      }
-    } catch (queryError) {
-      // Query failed — keep as pending, let polling continue
-      console.warn("STK query error:", queryError?.response?.data || queryError.message);
+      const { ResultCode, ResultDesc } = qr.data;
+      if (ResultCode === "0") { await updateOrderStatus(checkoutRequestId,"PAID"); order.status="PAID"; }
+      else if (ResultCode !== "1032") { await markOrderFailed(checkoutRequestId, ResultDesc); order.status="FAILED"; }
+    } catch (e) {
+      console.warn("Query error:", e?.response?.data || e.message);
     }
   }
 
   res.json({
-    success: true,
-    status: order.status,
-    orderId: order.orderId,
-    mpesaReceiptNumber: order.mpesaReceiptNumber || null,
-    amount: order.paidAmount || order.amount,
-    customerName: order.customerName,
+    success: true, status: order.status,
+    orderId: order.order_id,
+    mpesaReceiptNumber: order.mpesa_receipt || null,
+    amount: order.paid_amount || order.amount,
+    customerName: order.customer_name,
   });
 });
 
-/**
- * GET /api/orders
- * View all orders (admin — secure this in production!)
- */
-app.get("/api/orders", (req, res) => {
-  const allOrders = Array.from(orders.values()).sort(
-    (a, b) => new Date(b.createdAt) - new Date(a.createdAt)
-  );
-  res.json({ success: true, total: allOrders.length, orders: allOrders });
+// ✅ FIX 3 — /api/orders is now protected with requireAdminAuth
+app.get("/api/orders", requireAdminAuth, async (req, res) => {
+  const { rows } = await pool.query("SELECT * FROM orders ORDER BY created_at DESC");
+  res.json({ success: true, total: rows.length, orders: rows });
 });
 
-/**
- * GET /api/health
- * Health check
- */
 app.get("/api/health", (req, res) => {
   res.json({
     status: "ok",
     business: process.env.BUSINESS_NAME || "Loosian Grocers",
     env: MPESA_CONFIG.env,
+    callbackUrl: MPESA_CONFIG.callbackUrl,  // ✅ FIX 2 — visible in health check
     timestamp: new Date().toISOString(),
   });
 });
 
-// ─── START ───────────────────────────────────────────────────────────────────
+// ─── START ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`
+initDB().then(() => {
+  app.listen(PORT, () => {
+    console.log(`
 ╔══════════════════════════════════════════╗
 ║   🌿 LOOSIAN GROCERS SHOP SERVER         ║
-║      Running on http://localhost:${PORT}    ║
-║      M-Pesa ENV: ${(MPESA_CONFIG.env + "          ").slice(0,10)}         ║
+║   http://localhost:${PORT}                  ║
+║   M-Pesa : ${(MPESA_CONFIG.env+"        ").slice(0,8)}  Database: PostgreSQL ✅  ║
+║   Admin  : Bearer token secured ✅        ║
 ╚══════════════════════════════════════════╝
-  `);
+    `);
+  });
+}).catch(err => {
+  console.error("❌ DB connection failed:", err.message);
+  process.exit(1);
 });
 
 module.exports = app;
